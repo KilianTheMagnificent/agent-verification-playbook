@@ -26,8 +26,9 @@ Running the last command against this repository prints:
 ```text
 Target:  .
 Verdict: ALLOW_WITH_DISCLOSURE
-Scanned: 1 file(s)
+Scanned: 2 file(s)
   - CONTRIBUTING.md
+  - .github/ISSUE_TEMPLATE/bug_report.md
 
 Policy findings:
   [ALLOW_WITH_DISCLOSURE] AI_ALLOWED_WITH_DISCLOSURE at CONTRIBUTING.md:5
@@ -41,6 +42,14 @@ Disclosure & workflow hints:
   [HINT] OUTSIDE_PR_CLOSED_HINT at CONTRIBUTING.md:17
     Note:    Outside pull requests are closed; participate via issues only.
     Excerpt: Andre directs development of this repository with AI coding assistants and cannot personally review outside code changes. Outside pull requests are turned of...
+```
+
+Or run `check-repo-policy` directly via `uvx` / `pipx` (zero runtime dependencies, packaged via [`pyproject.toml`](pyproject.toml)):
+
+```sh
+uvx --from git+https://github.com/KilianTheMagnificent/agent-verification-playbook check-repo-policy owner/repo --strict
+# or from a local checkout:
+uvx --from . check-repo-policy --local-dir . --strict
 ```
 
 ### Scanning a live GitHub repository
@@ -74,6 +83,7 @@ Invalid CLI arguments, invalid repo slugs, or missing local directories return e
 ### Pre-flight scanner & tests
 
 - [`scripts/check_repo_policy.py`](scripts/check_repo_policy.py) — executable CLI and importable Python module (`scan_local_dir`, `scan_github_repo`, `scan_content`, `extract_html_comments`, `extract_display_none_blocks`).
+- [`pyproject.toml`](pyproject.toml) — minimal stdlib-only packaging metadata exposing the `check-repo-policy` console script for `uvx` / `pipx`.
 - [`tests/test_check_repo_policy.py`](tests/test_check_repo_policy.py) — offline `unittest` suite covering AI-friendly policies, human-prose Draft-Only policies, AI bans, hidden HTML comment traps (including entity-obfuscated and unclosed comments), hidden `display: none` / CSS-class / `hidden`-attribute traps, `VOUCHED.td` gates, silent repos, org-level `.github` overrides, and strict CLI exit codes.
 
 ### Empirical-proof issue templates
@@ -88,6 +98,10 @@ Invalid CLI arguments, invalid repo slugs, or missing local directories return e
 
 - [`checklists/pre-submission-verifier-rubric.md`](checklists/pre-submission-verifier-rubric.md) — the 7-gate independent Executor → Verifier checklist and sign-off block.
 - [`checklists/behavioral-verification-without-reading-code.md`](checklists/behavioral-verification-without-reading-code.md) — plain-language guide to the four-invoice check and mechanical oracles, grounded in public examples ([`KilianTheMagnificent/inbox-guard`](https://github.com/KilianTheMagnificent/inbox-guard), [`modelcontextprotocol/inspector#2980`](https://github.com/modelcontextprotocol/inspector/issues/2980) → [`PR #3016`](https://github.com/modelcontextprotocol/inspector/pull/3016), and [`google-deepmind/formal-conjectures#7590`](https://github.com/google-deepmind/formal-conjectures/issues/7590)).
+
+### Worked case studies
+
+- [`examples/worked-case-study-mcp-and-wcp.md`](examples/worked-case-study-mcp-and-wcp.md) — real end-to-end verification walkthrough without reading source code: live policy scans against `modelcontextprotocol/python-sdk` (`DRAFT_ONLY`) vs. `modelcontextprotocol/servers` (issues-only), empirical stdio/CLI checks on `modelcontextprotocol/inspector#2980` (merged in `PR #3016`) and `#3021` (`MCP_CATALOG_PATH` + `--config`), and using GitHub Actions CI as an independent oracle to catch real Linux, concurrency, and boundary-math bugs in `wcp` and `luck-filter`.
 
 ## Scope & limitations
 
