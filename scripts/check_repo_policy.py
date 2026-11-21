@@ -18,6 +18,7 @@ Always re-read a project's live policies yourself before contributing.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 import html
 import json
@@ -372,6 +373,7 @@ def _find_hidden_block_spans(text: str) -> List[Tuple[int, int, int, str, str]]:
     """Locate hidden HTML elements as (start_idx, end_idx, start_line, inner_text, mechanism)."""
     hidden_classes, hidden_ids = _extract_hidden_css_selectors(text)
     spans: List[Tuple[int, int, int, str, str]] = []
+    lower_text = text.lower()
     n = len(text)
     pos = 0
     line = 1
@@ -407,7 +409,7 @@ def _find_hidden_block_spans(text: str) -> List[Tuple[int, int, int, str, str]]:
         self_closing = tag_content.endswith("/")
         if tag_name in {"script", "style"}:
             close_tag = f"</{tag_name}>"
-            close_idx = text.lower().find(close_tag, gt + 1)
+            close_idx = lower_text.find(close_tag, gt + 1)
             next_pos = (close_idx + len(close_tag)) if close_idx != -1 else n
             line += text.count("\n", lt, next_pos)
             pos = next_pos
@@ -431,7 +433,6 @@ def _find_hidden_block_spans(text: str) -> List[Tuple[int, int, int, str, str]]:
             # Scan forward for the matching closing tag of the same tag_name.
             depth = 1
             scan = gt + 1
-            lower_text = text.lower()
             open_pat = f"<{tag_name}"
             close_pat = f"</{tag_name}"
             block_end = n
@@ -484,8 +485,11 @@ def extract_display_none_blocks(text: str) -> List[Tuple[int, str]]:
     return [(start_line, inner_text) for _, _, start_line, inner_text, _ in _find_hidden_block_spans(text)]
 
 
-def _mask_hidden_regions(text: str) -> str:
-    """Replace HTML comments and hidden HTML elements with newlines preserving line numbers."""
+def _mask_hidden_regions(
+    text: str,
+    hidden_spans: Optional[Sequence[Tuple[int, int, int, str, str]]] = None,
+) -> str:
+    """Replace HTML comments and hidden HTML elements with spaces preserving line numbers."""
     chars = list(text)
 
     # Mask HTML comments.
@@ -507,8 +511,9 @@ def _mask_hidden_regions(text: str) -> str:
                 chars[idx] = " "
         pos = end
 
-    # Mask hidden HTML blocks.
-    for start, end, _, _, _ in _find_hidden_block_spans(text):
+    # Mask hidden HTML blocks (reusing precomputed spans when available).
+    spans = _find_hidden_block_spans(text) if hidden_spans is None else hidden_spans
+    for start, end, _, _, _ in spans:
         for idx in range(start, end):
             if chars[idx] != "\n":
                 chars[idx] = " "
@@ -871,7 +876,8 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                 break
 
     # 3. Scan display:none / CSS-hidden / hidden-attribute blocks for anti-agent traps.
-    for _, _, line_no, hidden_text, mechanism in _find_hidden_block_spans(content):
+    hidden_spans = _find_hidden_block_spans(content)
+    for _, _, line_no, hidden_text, mechanism in hidden_spans:
         matched_trap_reason: Optional[str] = None
         for pattern, reason in HIDDEN_TRAP_PATTERNS:
             if pattern.search(hidden_text):
@@ -902,7 +908,7 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
             )
 
     # 4. Scan visible text line-by-line (preserving exact 1-based line numbers).
-    visible_text = _mask_hidden_regions(content)
+    visible_text = _mask_hidden_regions(content, hidden_spans=hidden_spans)
     seen_line_rules: Set[Tuple[int, str]] = set()
     for line_no, raw_line in enumerate(visible_text.splitlines(), start=1):
         line = raw_line.strip()
@@ -1187,37 +1193,72 @@ def _list_remote_policy_paths(
     use_gh: bool,
     timeout: int,
 ) -> Optional[List[str]]:
-    """List candidate policy paths via GitHub Contents API, or None if unavailable."""
+    """List candidate policy paths via GitHub Contents API, or None if unavailable.
+
+    Prunes missing subdirectories using the root and first-level directory listings
+    and aligns checked directories (including `doc/` and `docs/contributing/`) with
+    `scan_local_dir`.
+    """
     api_json = _gh_api_json if use_gh else _http_api_json
     ref_q = urllib.parse.quote(branch, safe="")
-    discovered: List[str] = []
-    dirs_to_check = [
-        "",
-        ".github",
-        ".github/ISSUE_TEMPLATE",
-        ".github/PULL_REQUEST_TEMPLATE",
-        "ISSUE_TEMPLATE",
-        "PULL_REQUEST_TEMPLATE",
-        "docs",
-        "doc/contributing",
-    ]
-    saw_root = False
-    for directory in dirs_to_check:
+
+    def _fetch_dir(directory: str) -> Optional[List[object]]:
         suffix = f"/{urllib.parse.quote(directory, safe='/')}" if directory else ""
         data = api_json(f"repos/{repo}/contents{suffix}?ref={ref_q}", timeout=timeout)
-        if not isinstance(data, list):
-            if directory == "":
-                return None
-            continue
-        if directory == "":
-            saw_root = True
-        for entry in data:
-            if not isinstance(entry, dict) or entry.get("type") != "file":
+        return data if isinstance(data, list) else None
+
+    root_data = _fetch_dir("")
+    if root_data is None:
+        return None
+
+    discovered: List[str] = []
+
+    def _collect(entries: Sequence[object]) -> Dict[str, str]:
+        subdirs: Dict[str, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
                 continue
+            entry_type = entry.get("type")
             path = entry.get("path")
-            if isinstance(path, str) and _is_policy_path(path):
+            name = entry.get("name")
+            if entry_type == "file" and isinstance(path, str) and _is_policy_path(path):
                 discovered.append(path)
-    return sorted(set(discovered)) if saw_root else None
+            elif entry_type == "dir" and isinstance(name, str) and isinstance(path, str):
+                subdirs[name.lower()] = path
+        return subdirs
+
+    root_dirs = _collect(root_data)
+
+    # Level-1 directories to inspect only if they actually exist in root.
+    level1_targets = (".github", "issue_template", "pull_request_template", "docs", "doc")
+    level1_existing = [(key, root_dirs[key]) for key in level1_targets if key in root_dirs]
+
+    nested_plan = {
+        ".github": ("issue_template", "pull_request_template"),
+        "docs": ("contributing",),
+        "doc": ("contributing",),
+    }
+    level2_dirs: List[str] = []
+
+    if level1_existing:
+        with ThreadPoolExecutor(max_workers=min(6, len(level1_existing))) as pool:
+            futures = [(key, pool.submit(_fetch_dir, dir_path)) for key, dir_path in level1_existing]
+            for key, future in futures:
+                entries = future.result()
+                if entries is None:
+                    continue
+                child_dirs = _collect(entries)
+                for child_key in nested_plan.get(key, ()):
+                    if child_key in child_dirs:
+                        level2_dirs.append(child_dirs[child_key])
+
+    if level2_dirs:
+        with ThreadPoolExecutor(max_workers=min(6, len(level2_dirs))) as pool:
+            for entries in pool.map(_fetch_dir, level2_dirs):
+                if entries is not None:
+                    _collect(entries)
+
+    return sorted(set(discovered))
 
 
 def _fetch_single_github_repo(
@@ -1268,22 +1309,35 @@ def _fetch_single_github_repo(
     for candidate_branch in branches_to_try:
         paths = _list_remote_policy_paths(repo, candidate_branch, use_gh=use_gh, timeout=timeout)
         if paths is not None:
-            for path in paths:
-                content = fetch_raw(repo, candidate_branch, path, timeout=timeout)
-                if content is not None:
-                    docs.append(
-                        ScannedFile(
-                            path=f"{prefix}{path}",
-                            content=content,
-                            source="gh" if use_gh else "raw",
+            if paths:
+                with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
+                    contents = list(
+                        pool.map(
+                            lambda p: fetch_raw(repo, candidate_branch, p, timeout=timeout),
+                            paths,
                         )
                     )
+                for path, content in zip(paths, contents):
+                    if content is not None:
+                        docs.append(
+                            ScannedFile(
+                                path=f"{prefix}{path}",
+                                content=content,
+                                source="gh" if use_gh else "raw",
+                            )
+                        )
             return docs, warnings
 
-        # Directory listing unavailable (e.g., API rate limit): probe raw URLs directly.
+        # Directory listing unavailable (e.g., API rate limit): probe raw URLs in parallel.
+        with ThreadPoolExecutor(max_workers=min(8, len(RAW_FALLBACK_PATHS))) as pool:
+            probed = list(
+                pool.map(
+                    lambda p: _http_fetch_raw(repo, candidate_branch, p, timeout=timeout),
+                    RAW_FALLBACK_PATHS,
+                )
+            )
         probed_any = False
-        for path in RAW_FALLBACK_PATHS:
-            content = _http_fetch_raw(repo, candidate_branch, path, timeout=timeout)
+        for path, content in zip(RAW_FALLBACK_PATHS, probed):
             if content is not None:
                 probed_any = True
                 docs.append(ScannedFile(path=f"{prefix}{path}", content=content, source="raw"))
