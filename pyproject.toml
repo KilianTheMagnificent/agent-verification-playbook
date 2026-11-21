@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-verification-playbook"
-version = "0.1.0"
+version = "0.1.1"
 description = "Zero-dependency repository AI-policy scanner and verification toolkit for non-coders directing AI agents."
 readme = "README.md"
 requires-python = ">=3.9"
