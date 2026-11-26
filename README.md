@@ -67,14 +67,16 @@ python3 scripts/check_repo_policy.py --local-dir ./path/to/repo --org-dir ./path
 
 ## Policy verdicts
 
-Strictest rule wins across all scanned files (`CONTRIBUTING.*`, `AI_POLICY.*`, `AGENTS.md`, `CLAUDE.md`, `.github/VOUCHED.td`, `.github/ISSUE_TEMPLATE/*`, `.github/PULL_REQUEST_TEMPLATE*`, and `<owner>/.github` equivalents):
+Strictest rule wins across all scanned files. The scanner checks contribution and AI policy files, agent instructions, issue and PR templates, vouch lists, and relevant vouch or slop workflows, including equivalents in the owner's `.github` repository.
 
 | Verdict | `--strict` exit code | Meaning |
 | --- | :---: | --- |
-| `ALLOW_WITH_DISCLOSURE` | `0` | Policy explicitly welcomes or permits AI-assisted work with disclosure, and no ban, hidden trap, vouch gate, or human-prose-only rule matched. |
+| `ALLOW_WITH_DISCLOSURE` | `0` | Policy explicitly welcomes or permits AI-assisted work, the scan completed, and no stricter rule matched. Follow any disclosure instructions in the policy. |
 | `DENY` | `2` | Hard stop: explicit AI ban, hidden `<!-- ... -->` or `display: none` anti-agent trap, or `VOUCHED.td` outsider gate detected. |
 | `DRAFT_ONLY` | `3` | Local AI testing or research may be allowed, but prose must be written and posted by a human in their own words (or autonomous agents are banned). |
-| `MANUAL_CHECK_REQUIRED` | `4` | No explicit AI policy was found, a fetch warning occurred, or unexplained hidden text needs manual review. Silence is never assumed to be consent. |
+| `MANUAL_CHECK_REQUIRED` | `4` | No explicit AI policy was found, the scan was incomplete, or hidden text needs manual review. |
+
+Incomplete GitHub scans list the affected files or directories under **Warnings** in terminal output and `warnings` in JSON. This covers failed reads, API listing limits, and fallback probes that cannot discover custom filenames. A confirmed `DENY` or `DRAFT_ONLY` finding still determines the verdict.
 
 Invalid CLI arguments, invalid repo slugs, or missing local directories return exit code `1`.
 
@@ -110,7 +112,9 @@ Invalid CLI arguments, invalid repo slugs, or missing local directories return e
 
 ## Current status and how this was built
 
-**Status:** `0.1` — active, zero-dependency, tested offline on Python 3.9+.
+**Status:** `0.2.0` — active, zero-dependency, tested offline on Python 3.9+.
+
+Version 0.2.0 distinguishes AI quality guidance, formatting comments, and advisory vouch lists from blocking rules. It also recognizes more human-authorship and autonomous-submission restrictions and flags incomplete GitHub scans.
 
 **How this was built:** Andre Romero directs development of this repository using AI coding assistants and verifies results behaviorally rather than by hand-auditing every line of code. The policy scanner is verified against an offline unit test suite covering real-world policy categories and synthetic hidden anti-agent traps, plus fresh-clone runs following this README literally. Because Andre cannot personally review outside code changes, outside pull requests are turned off; bug reports and new policy-pattern suggestions are welcome via issues (see [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 

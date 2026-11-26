@@ -2,8 +2,8 @@
 """Pre-flight repository AI-policy scanner (Python 3.9+ stdlib only).
 
 Fetches or reads repository policy files (CONTRIBUTING.*, AI_POLICY.*,
-AGENTS.md, CLAUDE.md, .github/VOUCHED.td, .github/ISSUE_TEMPLATE/*,
-.github/PULL_REQUEST_TEMPLATE*, and org-level .github equivalents), inspects
+AGENTS.md, CLAUDE.md, .github/VOUCHED.td, issue and PR templates, relevant
+vouch and slop workflows, and org-level .github equivalents), inspects
 both visible text and hidden HTML comments / display:none blocks for
 anti-agent traps, and classifies the repository into:
 
@@ -21,6 +21,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 import html
+import http.client
 import json
 from pathlib import Path
 import re
@@ -55,7 +56,7 @@ VERDICT_DRAFT_ONLY = "DRAFT_ONLY"
 VERDICT_ALLOW_WITH_DISCLOSURE = "ALLOW_WITH_DISCLOSURE"
 VERDICT_MANUAL_CHECK_REQUIRED = "MANUAL_CHECK_REQUIRED"
 
-USER_AGENT = "agent-verification-playbook-policy-scanner/0.1"
+USER_AGENT = "agent-verification-playbook-policy-scanner/0.2.0"
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 # Candidate file names checked in repo root, .github/, docs/, and org .github.
@@ -77,6 +78,9 @@ POLICY_BASENAME_EXACT = {
 POLICY_STEM_PREFIXES = ("contributing", "ai_policy", "ai-policy", "ai_guidelines", "ai-guidelines")
 TEMPLATE_EXTENSIONS = {".md", ".markdown", ".yml", ".yaml", ".txt", ".rst", ".adoc", ".html", ""}
 MAX_FILE_BYTES = 512 * 1024  # 512 KiB safety ceiling per fetched policy file
+MAX_API_BYTES = 2 * 1024 * 1024  # Contents listings can be larger than policy files.
+CONTENTS_DIRECTORY_LIMIT = 1000
+FetchStatus = Union[int, str]
 
 # Direct raw-URL fallback probes when directory listing is unavailable.
 RAW_FALLBACK_PATHS = (
@@ -97,6 +101,8 @@ RAW_FALLBACK_PATHS = (
     ".github/copilot-instructions.md",
     ".github/VOUCHED.td",
     "VOUCHED.td",
+    ".github/workflows/vouch-check-pr.yml",
+    ".github/workflows/on-slop.yml",
     ".github/ISSUE_TEMPLATE.md",
     ".github/ISSUE_TEMPLATE/bug_report.md",
     ".github/ISSUE_TEMPLATE/bug_report.yml",
@@ -521,6 +527,22 @@ def _mask_hidden_regions(
     return "".join(chars)
 
 
+# A formatting-only reminder can address agents without imposing a contribution rule.
+FORMATTING_COMMENT_RE = re.compile(
+    r"ai\s+agents?:\s+(?:please\s+)?(?:do\s+not|don['’]t)\s+hard[- ]wrap\s+paragraphs"
+    r"(?:[.;]\s+github renders every line break, so keep each paragraph on a single line)?[.!]?",
+    re.IGNORECASE,
+)
+
+VOUCH_SETTING_RE = re.compile(
+    r"""^\s*require-vouch:\s*(?P<quote>["']?)(?P<setting>true|false)(?P=quote)\s*(?:#.*)?$""",
+    re.IGNORECASE,
+)
+VOUCH_OPTIONAL_RE = re.compile(
+    r"\bbeing absent from this file blocks nothing\b",
+    re.IGNORECASE,
+)
+
 # Hidden-block anti-agent trap patterns.
 HIDDEN_TRAP_PATTERNS: Tuple[Tuple[Pattern[str], str], ...] = (
     (
@@ -552,7 +574,8 @@ HIDDEN_TRAP_PATTERNS: Tuple[Tuple[Pattern[str], str], ...] = (
     (
         re.compile(
             r"\b(?:include|insert|add|mention|put|write|append|start\s+with|end\s+with)\s+"
-            r"(?:the\s+)?(?:exact\s+)?(?:secret\s+)?(?:word|phrase|codeword|keyword|canary|token|magic\s+word)\b",
+            r"(?:the\s+)?(?:exact\s+)?(?:secret\s+)?(?:word|phrase|codeword|keyword|canary|token|magic\s+word)\b"
+            r"|\b(?:include|insert|add|append)\s+(?:the\s+)?(?::[a-z0-9_+-]+:|ASLOP-PR-VERIFY\b)",
             re.IGNORECASE,
         ),
         "Hidden canary/keyword honeypot instruction detected.",
@@ -589,7 +612,7 @@ _AI_MODIFIER_LIST = rf"{_AI_MODIFIER}(?:\s*(?:,|/|\bor\b|\band\b)\s*{_AI_MODIFIE
 _CONTRIB_NOUN = (
     r"(?:contributions?|pull\s+requests?|prs?|"
     r"issues?(?!\s+(?:descriptions?|text|prose|bod(?:y|ies)))|"
-    r"code|patches?|submissions?|work|content|slop|tools?)"
+    r"code|patches?|submissions?|work|content|tools?)"
 )
 _CONTRIB_NOUN_LIST = rf"{_CONTRIB_NOUN}(?:\s*(?:,|\bor\b|\band\b)\s*{_CONTRIB_NOUN})*"
 _ALLOW_NOUN = (
@@ -603,7 +626,9 @@ DENY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
     (
         "AI_CONTRIBUTION_BAN",
         re.compile(
-            rf"\b(?:no|zero)\s+(?:tolerance\s+for\s+)?{_AI_MODIFIER_LIST}\s+{_CONTRIB_NOUN_LIST}\b",
+            rf"\b(?:no|zero)\s+(?:tolerance\s+for\s+)?{_AI_MODIFIER_LIST}\s+{_CONTRIB_NOUN_LIST}\b"
+            r"(?!\s+were\s+used)\b"
+            r"|^[-*]\s+\[[ x]\]\s+no\s+ai\s+tools\s+were\s+used\b",
             re.IGNORECASE,
         ),
         "Policy explicitly prohibits AI-generated or AI-assisted contributions.",
@@ -647,12 +672,34 @@ DENY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
         "Policy declares contributions strictly human-only or bans AI submissions.",
     ),
     (
+        "AI_CONTRIBUTION_BAN",
+        re.compile(
+            r"\bcontributions?\s+must\s+not\s+include\s+content\s+generated\s+by\s+"
+            r"(?:large\s+language\s+models?|llms?|ai)\b",
+            re.IGNORECASE,
+        ),
+        "Policy prohibits contributions containing AI-generated content.",
+    ),
+    (
+        "AUTONOMOUS_AGENT_BAN",
+        re.compile(
+            r"\baccounts\s+controlled\s+by\s+autonomous\s+(?:ai\s+)?(?:bots?|agents?)\s+"
+            r"(?:are\s+)?(?:forbidden|banned|prohibited|not\s+allowed)\b"
+            r"|\b(?:do\s+not|don't)\s+allow\s+autonomous\s+agents\s+to\s+be\s+used\s+for\s+"
+            r"contributing[^.!?]{0,200}[.!?]\s+we\s+will\s+close\b"
+            r"|\babsolutely\s+no\s+unsupervised\s+agentic\s+tools\b",
+            re.IGNORECASE,
+        ),
+        "Policy explicitly forbids autonomous agent accounts or closes autonomous submissions.",
+    ),
+    (
         "VOUCH_GATE",
         re.compile(
-            r"\bunvouched\s+(?:contributors?|outsiders?|users?|prs?|pull\s+requests?|issues?)"
-            r".{0,80}\b(?:auto[- ]?clos\w*|automatically\s+clos\w*|reject\w*|block\w*|not\s+accepted)\b"
+            r"\bunvouched\s+(?:contributors?|outsiders?|users?|prs?|pull\s+requests?|issues?)\b"
+            r"(?:(?!\b(?:not|never|no|nothing)\b|n['’]t\b)[^.!?\n]){0,80}?"
+            r"\b(?:auto[- ]?clos\w*|automatically\s+clos\w*|closed|rejected|blocked|not\s+accepted)\b"
             r"|\bmust\s+be\s+vouched\s+(?:for\s+)?(?:before|to)\s+(?:contribut\w*|open\w*|submit\w*)\b"
-            r"|\b(?:uses?|enforces?|requires?|listed\s+in|see)\s+`?(?:\.github/)?vouched\.td`?\b",
+            r"|\b(?:must|need\s+to)\s+be\s+listed\s+in\s+`?(?:\.github/)?vouched\.td\b",
             re.IGNORECASE,
         ),
         "Policy enforces a maintainer vouch gate that blocks unvouched outsiders.",
@@ -667,7 +714,20 @@ DRAFT_ONLY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
             r"\bhuman\s+communication\s+must\s+remain\s+human\b"
             r"|\b(?:must\s+be|should\s+be)\s+(?:written\s+by\s+(?:a\s+)?human|human[- ]written|written\s+in\s+your\s+own\s+words)\b"
             r"|\bwrite\s+(?:all\s+)?(?:issues?|comments?|descriptions?|reports?|replies|messages?)\s+in\s+your\s+own\s+words\b"
-            r"|\bin\s+your\s+own\s+words\b",
+            r"|\bin\s+your\s+own\s+words\b"
+            r"|\b(?:must|should|expected\s+to)\s+be\s+written\s+in\s+"
+            r"(?:the\s+contributor['’]s|your)\s+own\s+(?:words|voice)\b"
+            r"|\bplease\s+use\s+(?:simple,\s+)?human[- ]written\s+(?:english|prose)\b"
+            r"|\b(?:comments?|replies)\b[^.!?]{0,80}\bmay\s+not\s+be\s+written\s+with\s+"
+            r"(?:llms?|ai)\b"
+            r"|\bdo\s+not\s+paste\s+(?:llm|ai)\s+output\s+verbatim\b"
+            r"|\bwrite\s+(?:the|your)\s+(?:pr|pull\s+request|issue)\s+description\s+yourself\b"
+            r"|\bplease\s+use\s+your\s+own\s+words\b"
+            r"|\b(?:do\s+not|don't)\s+use\s+(?:an?\s+)?(?:llms?|ai)\s+to\s+"
+            r"(?:fill\s+in\s+templates?|respond\s+to\s+(?:review\s+)?comments?)\b"
+            r"|\bplease\s+avoid\s+using\s+(?:llms?|ai)\s+to\s+generate\s+the\s+description\s+text\b"
+            r"|\b(?:do\s+not|don't)\s+(?:push|post|submit)\s+(?:llms?|ai)[- ]generated\s+"
+            r"(?:issues?|pull[- ]requests?|prs?)\b",
             re.IGNORECASE,
         ),
         "Policy requires human-written prose in the contributor's own words.",
@@ -677,7 +737,7 @@ DRAFT_ONLY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
         re.compile(
             r"\b(?:do\s+not|don't|never|must\s+not|no)\s+(?:post|submit|use|paste)?\s*"
             r"(?:ai|llm)[- ]?(?:generated|written|authored)\s+"
-            r"(?:prose|comments?|descriptions?|messages?|replies|discussion|communication|text)\b",
+            r"(?:prose|(?:review\s+)?comments?|descriptions?|messages?|replies|discussion|communication|text)\b",
             re.IGNORECASE,
         ),
         "Policy forbids AI-written comments, descriptions, or discussion text.",
@@ -699,7 +759,11 @@ DRAFT_ONLY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
             r"(?:must\s+not|may\s+not|cannot|should\s+not|are\s+not\s+(?:allowed|permitted)\s+to)\s+"
             r"(?:open|file|post|submit|create|comment|act\s+autonomously|send\s+anything|interact\s+directly)\b"
             r"|\b(?:do\s+not|don't|never)\s+let\s+(?:an?\s+)?(?:ai|llm|agent|bot)\s+"
-            r"(?:open|file|post|submit|comment|act)\b",
+            r"(?:open|file|post|submit|comment|act)\b"
+            r"|\b(?:will\s+not|won't)\s+accept\s+(?:prs?|pull\s+requests?)\s+"
+            r"(?:opened|submitted)(?:\s+or\s+submitted)?\s+by\s+ai\s+agents?\b"
+            r"|\b(?:must|should)\s+be\s+opened\s+by\s+a\s+(?:real\s+person|human)\b"
+            r"|\bthe\s+human\s+submitter\s+is\s+responsible\s+for\s+the\s+entire\s+contribution\b",
             re.IGNORECASE,
         ),
         "Policy prohibits agents from posting, opening issues/PRs, or acting directly.",
@@ -709,6 +773,7 @@ DRAFT_ONLY_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
         re.compile(
             r"\b(?:must|expected\s+to)\s+(?:fully\s+)?understand\s+(?:and\s+(?:be\s+able\s+to\s+)?explain\s+)?"
             r"(?:every|all)\s+(?:line|change|code|contribution)\b"
+            r"|^[-*]\s+understand\s+every\s+change\s+you\s+submit,?\s+and\s+be\s+able\s+to\s+explain\s+it\b"
             r"|\bexplain\s+(?:your\s+)?(?:proposed\s+)?changes?\s+in\s+your\s+own\s+words\b"
             r"|\bpersonally\s+understood,\s+tested,?\s+and\s+verified\b"
             r"|\bhuman[- ]in[- ]the[- ]loop\s+must\s+(?:fully\s+understand|review\s+and\s+(?:submit|post))\b",
@@ -744,6 +809,7 @@ ALLOW_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
             r"\b(?:please\s+|must\s+|should\s+)?disclose\s+(?:any\s+|your\s+)?"
             r"(?:ai|llm|generative\s+ai|coding\s+assistant)\b"
             r"|\b(?:ai|llm)\s+(?:usage|use|assistance|help)\s+(?:must|should)\s+be\s+disclosed\b"
+            r"|\busing\s+(?:a\s+model\s+to\s+help|ai\s+to\s+write\s+code)\s+is\s+fine\b"
             r"|\b(?:if\s+you\s+used?\s+(?:an?\s+)?(?:ai|llm|coding\s+assistant)|"
             r"when\s+using\s+(?:ai|llm)\s+tools?).{0,80}\b(?:disclose|note|mention|state|indicate)\b",
             re.IGNORECASE,
@@ -754,6 +820,15 @@ ALLOW_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
 
 # Non-blocking operational hints surfaced alongside any verdict.
 HINT_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
+    (
+        "HUMAN_ATTESTATION_HINT",
+        re.compile(
+            r"^[-*]\s+label:\s*[\"']?i\s*\(a\s+human\)\s+examined\b[^.!?]{0,120}\b"
+            r"(?:wrote\s+or\s+reviewed)\b",
+            re.IGNORECASE,
+        ),
+        "Issue form asks the submitter to attest to human review of the report.",
+    ),
     (
         "DISCLOSURE_FORMAT_HINT",
         re.compile(
@@ -804,6 +879,64 @@ HINT_RULES: Tuple[Tuple[str, Pattern[str], str], ...] = (
 )
 
 
+# These directives can span multiple lines in Markdown.
+TURN_OFF_AUTONOMOUS_AGENT_RE = re.compile(
+    r"\bagent\s+filing\s+(?:issues?|prs?|pull\s+requests?)(?:\s+or\s+(?:prs?|pull\s+requests?))?\s+"
+    r"against\s+this\s+repository\s+autonomously,?\s+please\s+turn\s+it\s+off\b",
+    re.IGNORECASE,
+)
+
+
+EXTERNAL_AI_POLICY_RE = re.compile(
+    r"\b(?:follow(?:s)?|adopts?)\s+(?:the\s+)?same\s+"
+    r"(?:ai\s+usage\s+conventions|\[(?:llm|ai)\s+usage\s+policy\])\s+as\s+[^\n]+"
+    r"|\b(?:please\s+)?review\s+https://[^\s<>]+#(?:llm-and-ai-policy|ai-policy)\b",
+    re.IGNORECASE,
+)
+
+
+VOUCH_CHECK_USE_RE = re.compile(
+    r"^\s*(?:-\s+)?uses:\s*[\"']?mitchellh/vouch/action/check-[a-z-]+@",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _workflow_vouch_optional(content: str) -> Optional[bool]:
+    """True if every vouch check is explicitly optional, False if any can gate, None if none."""
+    settings = [required for _, _, required in _vouch_workflow_settings(content)]
+    uses = len(VOUCH_CHECK_USE_RE.findall(content))
+    if not settings and not uses:
+        return None
+    # The action's require-vouch input defaults to true, so an unset check is a gate.
+    return not any(settings) and len(settings) >= uses
+
+
+def _is_policy_workflow(path: str) -> bool:
+    parent, _, filename = path.lower().rpartition("/")
+    return (
+        (parent == ".github/workflows" or parent.endswith("/.github/workflows"))
+        and Path(filename).suffix in {".yml", ".yaml"}
+        and re.search(r"(?:^|[-_])(?:vouch|slop)(?=[-_.])", filename) is not None
+    )
+
+
+def _vouch_scope(path: str) -> str:
+    parent = path.rpartition("/")[0]
+    for suffix in (".github/workflows", ".github"):
+        if parent == suffix:
+            return ""
+        if parent.endswith("/" + suffix):
+            return parent[: -len(suffix) - 1]
+    return parent
+
+
+def _vouch_workflow_settings(content: str) -> Iterable[Tuple[int, str, bool]]:
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        match = VOUCH_SETTING_RE.fullmatch(line)
+        if match:
+            yield line_no, line, match.group("setting").lower() == "true"
+
+
 def _is_policy_path(rel_path: str) -> bool:
     """Return True if rel_path is a policy, agent-instruction, vouch, or template file."""
     norm = rel_path.replace("\\", "/")
@@ -817,6 +950,9 @@ def _is_policy_path(rel_path: str) -> bool:
     filename = lower_parts[-1]
     stem = Path(filename).stem
     ext = Path(filename).suffix
+
+    if _is_policy_workflow(norm):
+        return True
 
     # Check VOUCHED.td anywhere in root or .github/
     if filename == "vouched.td" and len(lower_parts) <= 2:
@@ -838,14 +974,28 @@ def _is_policy_path(rel_path: str) -> bool:
     return False
 
 
-def scan_content(file_path: str, content: str) -> List[Finding]:
+def scan_content(
+    file_path: str, content: str, *, optional_vouch_list: bool = False
+) -> List[Finding]:
     """Scan a single policy or template file and return all structured findings."""
     findings: List[Finding] = []
     norm_path = file_path.replace("\\", "/")
     basename = norm_path.rsplit("/", 1)[-1].lower()
 
-    # 1. VOUCHED.td gate file check.
+    # 1. Check vouch settings and lists. Workflow names never establish a policy.
+    if _is_policy_workflow(norm_path):
+        return [
+            Finding(
+                VERDICT_DENY, "VOUCH_GATE", norm_path, line_no, _clean_excerpt(line),
+                "Workflow requires contributors to be vouched.",
+            )
+            for line_no, line, required in _vouch_workflow_settings(content)
+            if required
+        ]
     if basename == "vouched.td":
+        prose = " ".join(line.lstrip("# ").strip() for line in content.splitlines())
+        if optional_vouch_list or VOUCH_OPTIONAL_RE.search(prose):
+            return []
         first_non_empty = next((ln.strip() for ln in content.splitlines() if ln.strip()), "(vouch list file)")
         findings.append(
             Finding(
@@ -861,6 +1011,8 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
 
     # 2. Scan hidden HTML comments (<!-- ... -->) for anti-agent traps.
     for line_no, comment_body in extract_html_comments(content):
+        if FORMATTING_COMMENT_RE.fullmatch(" ".join(comment_body.split())):
+            continue
         for pattern, reason in HIDDEN_TRAP_PATTERNS:
             if pattern.search(comment_body):
                 findings.append(
@@ -874,6 +1026,21 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                     )
                 )
                 break
+        else:
+            # Templates often hide ordinary contributor instructions in HTML comments.
+            plain_comment = comment_body.replace("**", "").replace("__", "")
+            for rule_id, pattern, reason in DRAFT_ONLY_RULES:
+                if rule_id == "HUMAN_PROSE_REQUIRED":
+                    match = pattern.search(plain_comment)
+                    if match:
+                        findings.append(
+                            Finding(
+                                VERDICT_DRAFT_ONLY, rule_id, norm_path, line_no,
+                                _clean_excerpt(match.group()),
+                                f"HTML template comment: {reason}",
+                            )
+                        )
+                        break
 
     # 3. Scan display:none / CSS-hidden / hidden-attribute blocks for anti-agent traps.
     hidden_spans = _find_hidden_block_spans(content)
@@ -907,20 +1074,39 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                 )
             )
 
-    # 4. Scan visible text line-by-line (preserving exact 1-based line numbers).
+    # 4. Scan visible policy text, preserving exact 1-based line numbers.
     visible_text = _mask_hidden_regions(content, hidden_spans=hidden_spans)
+    wrapped_rules = (
+        (
+            TURN_OFF_AUTONOMOUS_AGENT_RE, VERDICT_DRAFT_ONLY, "AUTONOMOUS_AGENT_BAN",
+            "Policy requires contributors to turn off agents that file issues or PRs autonomously.",
+        ),
+        (
+            EXTERNAL_AI_POLICY_RE, VERDICT_MANUAL_CHECK_REQUIRED, "EXTERNAL_AI_POLICY",
+            "Repository points to an external AI policy that requires manual review.",
+        ),
+    )
+    for pattern, verdict, rule_id, reason in wrapped_rules:
+        line_no, previous_start = 1, 0
+        for match in pattern.finditer(visible_text):
+            line_no += visible_text.count("\n", previous_start, match.start())
+            previous_start = match.start()
+            findings.append(Finding(verdict, rule_id, norm_path, line_no, _clean_excerpt(match.group()), reason))
+
     seen_line_rules: Set[Tuple[int, str]] = set()
     for line_no, raw_line in enumerate(visible_text.splitlines(), start=1):
         line = raw_line.strip()
+        # Emphasis can split a policy expression into multiple Markdown spans.
+        plain = line.replace("**", "").replace("__", "")
         if not line:
             continue
 
-        negated_ban = bool(BAN_NEGATION_GUARD_RE.search(line))
+        negated_ban = bool(BAN_NEGATION_GUARD_RE.search(plain))
 
         for rule_id, pattern, reason in DENY_RULES:
             if rule_id == "AI_CONTRIBUTION_BAN" and negated_ban:
                 continue
-            if pattern.search(line) and (line_no, rule_id) not in seen_line_rules:
+            if pattern.search(plain) and (line_no, rule_id) not in seen_line_rules:
                 seen_line_rules.add((line_no, rule_id))
                 findings.append(
                     Finding(
@@ -934,7 +1120,7 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                 )
 
         for rule_id, pattern, reason in DRAFT_ONLY_RULES:
-            if pattern.search(line) and (line_no, rule_id) not in seen_line_rules:
+            if pattern.search(plain) and (line_no, rule_id) not in seen_line_rules:
                 seen_line_rules.add((line_no, rule_id))
                 findings.append(
                     Finding(
@@ -948,7 +1134,7 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                 )
 
         for rule_id, pattern, reason in ALLOW_RULES:
-            if pattern.search(line) and (line_no, rule_id) not in seen_line_rules:
+            if pattern.search(plain) and (line_no, rule_id) not in seen_line_rules:
                 seen_line_rules.add((line_no, rule_id))
                 findings.append(
                     Finding(
@@ -962,7 +1148,7 @@ def scan_content(file_path: str, content: str) -> List[Finding]:
                 )
 
         for rule_id, pattern, reason in HINT_RULES:
-            if pattern.search(line) and (line_no, rule_id) not in seen_line_rules:
+            if pattern.search(plain) and (line_no, rule_id) not in seen_line_rules:
                 seen_line_rules.add((line_no, rule_id))
                 findings.append(
                     Finding(
@@ -988,9 +1174,18 @@ def scan_documents(
     policy_findings: List[Finding] = []
     hints: List[Finding] = []
 
+    vouch_states: Dict[str, List[bool]] = {}
+    for doc in documents:
+        if _is_policy_workflow(doc.path):
+            state = _workflow_vouch_optional(doc.content)
+            if state is not None:
+                vouch_states.setdefault(_vouch_scope(doc.path), []).append(state)
+    optional_vouch_scopes = {scope for scope, states in vouch_states.items() if all(states)}
     for doc in documents:
         scanned_paths.append(doc.path)
-        for item in scan_content(doc.path, doc.content):
+        for item in scan_content(
+            doc.path, doc.content, optional_vouch_list=_vouch_scope(doc.path) in optional_vouch_scopes
+        ):
             if item.classification == "HINT":
                 hints.append(item)
             else:
@@ -1001,7 +1196,7 @@ def scan_documents(
         verdict = VERDICT_DENY
     elif VERDICT_DRAFT_ONLY in classes:
         verdict = VERDICT_DRAFT_ONLY
-    elif VERDICT_MANUAL_CHECK_REQUIRED in classes:
+    elif fetch_warnings or VERDICT_MANUAL_CHECK_REQUIRED in classes:
         verdict = VERDICT_MANUAL_CHECK_REQUIRED
     elif VERDICT_ALLOW_WITH_DISCLOSURE in classes:
         verdict = VERDICT_ALLOW_WITH_DISCLOSURE
@@ -1009,9 +1204,9 @@ def scan_documents(
         verdict = VERDICT_MANUAL_CHECK_REQUIRED
 
     warnings = list(fetch_warnings)
-    if not scanned_paths:
+    if not scanned_paths and not warnings:
         warnings.append("No policy, contributing, agent, vouch, or template files were found.")
-    elif verdict == VERDICT_MANUAL_CHECK_REQUIRED and VERDICT_MANUAL_CHECK_REQUIRED not in classes:
+    elif verdict == VERDICT_MANUAL_CHECK_REQUIRED and not warnings and VERDICT_MANUAL_CHECK_REQUIRED not in classes:
         warnings.append(
             "No explicit AI contribution policy was matched; read the repository guidelines manually before acting."
         )
@@ -1037,6 +1232,7 @@ def _collect_local_policy_files(root: Path, prefix: str = "") -> List[ScannedFil
         root / ".github",
         root / ".github" / "ISSUE_TEMPLATE",
         root / ".github" / "PULL_REQUEST_TEMPLATE",
+        root / ".github" / "workflows",
         root / "ISSUE_TEMPLATE",
         root / "PULL_REQUEST_TEMPLATE",
         root / "docs",
@@ -1089,102 +1285,105 @@ def scan_local_dir(
     return scan_documents(docs, target=str(root), fetch_warnings=warnings)
 
 
-def _gh_api_json_status(endpoint: str, timeout: int = 15) -> Tuple[Optional[object], Optional[int]]:
-    """Run `gh api <endpoint>` and return (parsed_json, status_hint)."""
+def _gh_get_bytes(
+    endpoint: str, accept: str, timeout: int, limit: int,
+) -> Tuple[Optional[bytes], FetchStatus]:
     try:
         proc = subprocess.run(
-            ["gh", "api", endpoint],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None, None
-    if proc.returncode != 0:
-        err = (proc.stderr or "") + (proc.stdout or "")
-        if "HTTP 404" in err or '"status": "404"' in err or "Not Found" in err:
-            return None, 404
-        return None, None
-    if not proc.stdout.strip():
-        return None, None
-    try:
-        return json.loads(proc.stdout), 200
-    except json.JSONDecodeError:
-        return None, None
-
-
-def _gh_api_json(endpoint: str, timeout: int = 15) -> Optional[object]:
-    """Run `gh api <endpoint>` and parse JSON output, returning None on 404/error."""
-    data, _ = _gh_api_json_status(endpoint, timeout=timeout)
-    return data
-
-
-def _gh_fetch_raw(repo: str, branch: str, path: str, timeout: int = 15) -> Optional[str]:
-    """Fetch a raw file from GitHub using `gh api` with raw accept header."""
-    encoded_path = urllib.parse.quote(path, safe="/")
-    endpoint = f"repos/{repo}/contents/{encoded_path}?ref={urllib.parse.quote(branch, safe='')}"
-    try:
-        proc = subprocess.run(
-            ["gh", "api", "-H", "Accept: application/vnd.github.raw+json", endpoint],
+            ["gh", "api", "-H", f"Accept: {accept}", endpoint],
             capture_output=True,
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, "request timed out"
+    except OSError:
+        return None, "could not run gh"
     if proc.returncode != 0:
-        return None
-    return proc.stdout[:MAX_FILE_BYTES].decode("utf-8", errors="replace")
+        error = re.search(rb"HTTP ([45][0-9]{2})\b", proc.stderr)
+        return None, int(error.group(1)) if error else "gh API request failed"
+    if len(proc.stdout) > limit:
+        return None, f"response exceeds the {limit:,}-byte scan limit"
+    return proc.stdout, 200
 
 
 def _http_get_bytes_status(
-    url: str,
-    accept: Optional[str] = None,
-    timeout: int = 15,
-) -> Tuple[Optional[bytes], Optional[int]]:
-    headers = {"User-Agent": USER_AGENT}
-    if accept:
-        headers["Accept"] = accept
-    req = urllib.request.Request(url, headers=headers)
+    url: str, accept: str, timeout: int, limit: int,
+) -> Tuple[Optional[bytes], FetchStatus]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(MAX_FILE_BYTES), resp.status
+            if resp.status != 200:
+                return None, resp.status
+            raw = resp.read(limit + 1)
+            if len(raw) > limit:
+                return None, f"response exceeds the {limit:,}-byte scan limit"
+            declared_length = resp.headers.get("Content-Length", "")
+            if declared_length.isdecimal() and len(raw) != int(declared_length):
+                return None, "truncated HTTP response"
+            return raw, 200
     except urllib.error.HTTPError as exc:
+        exc.close()
         return None, exc.code
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return None, None
+    except (TimeoutError, urllib.error.URLError) as exc:
+        if isinstance(exc, TimeoutError) or isinstance(exc.reason, TimeoutError):
+            return None, "request timed out"
+        return None, "HTTP request failed"
+    except http.client.IncompleteRead:
+        return None, "truncated HTTP response"
+    except (OSError, http.client.HTTPException):
+        return None, "HTTP request failed"
 
 
-def _http_get_bytes(url: str, accept: Optional[str] = None, timeout: int = 15) -> Optional[bytes]:
-    raw, status = _http_get_bytes_status(url, accept=accept, timeout=timeout)
-    return raw if status == 200 else None
-
-
-def _http_api_json_status(endpoint: str, timeout: int = 15) -> Tuple[Optional[object], Optional[int]]:
-    url = f"https://api.github.com/{endpoint.lstrip('/')}"
-    raw, status = _http_get_bytes_status(url, accept="application/vnd.github+json", timeout=timeout)
-    if raw is None or status != 200:
+def _decode_api_json(raw: Optional[bytes], status: FetchStatus) -> Tuple[Optional[object], FetchStatus]:
+    if raw is None:
         return None, status
     try:
-        return json.loads(raw.decode("utf-8", errors="replace")), 200
-    except json.JSONDecodeError:
-        return None, None
+        return json.loads(raw), 200
+    except (ValueError, RecursionError):
+        return None, "invalid JSON API response"
 
 
-def _http_api_json(endpoint: str, timeout: int = 15) -> Optional[object]:
-    data, _ = _http_api_json_status(endpoint, timeout=timeout)
-    return data
+def _gh_api_json_status(endpoint: str, timeout: int = 15) -> Tuple[Optional[object], FetchStatus]:
+    return _decode_api_json(*_gh_get_bytes(endpoint, "application/vnd.github+json", timeout, MAX_API_BYTES))
 
 
-def _http_fetch_raw(repo: str, branch: str, path: str, timeout: int = 15) -> Optional[str]:
+def _http_api_json_status(endpoint: str, timeout: int = 15) -> Tuple[Optional[object], FetchStatus]:
+    url = f"https://api.github.com/{endpoint.lstrip('/')}"
+    return _decode_api_json(*_http_get_bytes_status(url, "application/vnd.github+json", timeout, MAX_API_BYTES))
+
+
+def _decode_policy_text(raw: Optional[bytes], status: FetchStatus) -> Tuple[Optional[str], FetchStatus]:
+    if raw is None:
+        return None, status
+    try:
+        return raw.decode("utf-8"), 200
+    except UnicodeDecodeError:
+        return None, "policy file is not valid UTF-8"
+
+
+def _gh_fetch_raw(
+    repo: str, branch: str, path: str, timeout: int = 15,
+) -> Tuple[Optional[str], FetchStatus]:
+    encoded_path = urllib.parse.quote(path, safe="/")
+    ref = urllib.parse.quote(branch, safe="")
+    endpoint = f"repos/{repo}/contents/{encoded_path}?ref={ref}"
+    return _decode_policy_text(*_gh_get_bytes(endpoint, "application/vnd.github.raw+json", timeout, MAX_FILE_BYTES))
+
+
+def _http_fetch_raw(
+    repo: str, branch: str, path: str, timeout: int = 15,
+) -> Tuple[Optional[str], FetchStatus]:
     encoded_path = urllib.parse.quote(path, safe="/")
     encoded_branch = urllib.parse.quote(branch, safe="")
     url = f"https://raw.githubusercontent.com/{repo}/{encoded_branch}/{encoded_path}"
-    raw = _http_get_bytes(url, timeout=timeout)
-    if raw is None:
-        return None
-    return raw.decode("utf-8", errors="replace")
+    return _decode_policy_text(*_http_get_bytes_status(url, "text/plain", timeout, MAX_FILE_BYTES))
+
+
+def _fetch_error(status: FetchStatus) -> str:
+    if status == 200:
+        return "unexpected API response"
+    return f"HTTP {status}" if isinstance(status, int) else status
 
 
 def _list_remote_policy_paths(
@@ -1192,73 +1391,80 @@ def _list_remote_policy_paths(
     branch: str,
     use_gh: bool,
     timeout: int,
-) -> Optional[List[str]]:
-    """List candidate policy paths via GitHub Contents API, or None if unavailable.
-
-    Prunes missing subdirectories using the root and first-level directory listings
-    and aligns checked directories (including `doc/` and `docs/contributing/`) with
-    `scan_local_dir`.
-    """
-    api_json = _gh_api_json if use_gh else _http_api_json
+) -> Tuple[Optional[List[str]], List[str]]:
+    """List candidate paths and identify any listings that were incomplete."""
+    api_status = _gh_api_json_status if use_gh else _http_api_json_status
     ref_q = urllib.parse.quote(branch, safe="")
+    warnings: List[str] = []
 
-    def _fetch_dir(directory: str) -> Optional[List[object]]:
+    def _fetch_dir(directory: str) -> Tuple[Optional[List[object]], List[str]]:
         suffix = f"/{urllib.parse.quote(directory, safe='/')}" if directory else ""
-        data = api_json(f"repos/{repo}/contents{suffix}?ref={ref_q}", timeout=timeout)
-        return data if isinstance(data, list) else None
+        data, status = api_status(f"repos/{repo}/contents{suffix}?ref={ref_q}", timeout=timeout)
+        location = f"{repo}@{branch}:{directory or '/'}"
+        if not isinstance(data, list):
+            return None, [f"Could not list {location} ({_fetch_error(status)})."]
+        if len(data) >= CONTENTS_DIRECTORY_LIMIT:
+            return data, [f"Listing {location} reached GitHub's {CONTENTS_DIRECTORY_LIMIT:,}-entry limit."]
+        return data, []
 
-    root_data = _fetch_dir("")
+    root_data, warnings = _fetch_dir("")
     if root_data is None:
-        return None
+        return None, warnings
 
     discovered: List[str] = []
 
-    def _collect(entries: Sequence[object]) -> Dict[str, str]:
+    def _collect(entries: Sequence[object], directory: str) -> Dict[str, str]:
         subdirs: Dict[str, str] = {}
+        invalid_entry = False
         for entry in entries:
             if not isinstance(entry, dict):
+                invalid_entry = True
                 continue
             entry_type = entry.get("type")
             path = entry.get("path")
             name = entry.get("name")
-            if entry_type == "file" and isinstance(path, str) and _is_policy_path(path):
-                discovered.append(path)
-            elif entry_type == "dir" and isinstance(name, str) and isinstance(path, str):
+            if not all(isinstance(value, str) for value in (entry_type, path, name)):
+                invalid_entry = True
+                continue
+            if entry_type == "dir":
                 subdirs[name.lower()] = path
+            elif _is_policy_path(path):
+                if entry_type in {"file", "symlink"}:
+                    discovered.append(path)
+                else:
+                    warnings.append(f"Could not read policy file {repo}@{branch}:{path} ({entry_type}).")
+        if invalid_entry:
+            warnings.append(f"Listing {repo}@{branch}:{directory or '/'} contained invalid entries.")
         return subdirs
 
-    root_dirs = _collect(root_data)
-
-    # Level-1 directories to inspect only if they actually exist in root.
-    level1_targets = (".github", "issue_template", "pull_request_template", "docs", "doc")
-    level1_existing = [(key, root_dirs[key]) for key in level1_targets if key in root_dirs]
-
+    root_dirs = _collect(root_data, "")
     nested_plan = {
-        ".github": ("issue_template", "pull_request_template"),
+        ".github": ("issue_template", "pull_request_template", "workflows"),
         "docs": ("contributing",),
         "doc": ("contributing",),
     }
+    level1_targets = (".github", "issue_template", "pull_request_template", "docs", "doc")
+    level1_existing = [(key, root_dirs[key]) for key in level1_targets if key in root_dirs]
     level2_dirs: List[str] = []
 
     if level1_existing:
         with ThreadPoolExecutor(max_workers=min(6, len(level1_existing))) as pool:
-            futures = [(key, pool.submit(_fetch_dir, dir_path)) for key, dir_path in level1_existing]
-            for key, future in futures:
-                entries = future.result()
-                if entries is None:
-                    continue
-                child_dirs = _collect(entries)
-                for child_key in nested_plan.get(key, ()):
-                    if child_key in child_dirs:
-                        level2_dirs.append(child_dirs[child_key])
+            directories = [path for _, path in level1_existing]
+            results = pool.map(_fetch_dir, directories)
+            for (key, path), (entries, problems) in zip(level1_existing, results):
+                warnings.extend(problems)
+                if entries is not None:
+                    child_dirs = _collect(entries, path)
+                    level2_dirs.extend(child_dirs[child] for child in nested_plan.get(key, ()) if child in child_dirs)
 
     if level2_dirs:
         with ThreadPoolExecutor(max_workers=min(6, len(level2_dirs))) as pool:
-            for entries in pool.map(_fetch_dir, level2_dirs):
+            for path, (entries, problems) in zip(level2_dirs, pool.map(_fetch_dir, level2_dirs)):
+                warnings.extend(problems)
                 if entries is not None:
-                    _collect(entries)
+                    _collect(entries, path)
 
-    return sorted(set(discovered))
+    return sorted(set(discovered)), warnings
 
 
 def _fetch_single_github_repo(
@@ -1271,79 +1477,55 @@ def _fetch_single_github_repo(
 ) -> Tuple[List[ScannedFile], List[str]]:
     """Fetch policy files for one GitHub repository."""
     warnings: List[str] = []
-    use_gh = False
-    if source in {"auto", "gh"} and shutil.which("gh"):
-        use_gh = True
-    elif source == "gh":
-        warnings.append("Requested --source gh, but 'gh' CLI was not found on PATH.")
-        return [], warnings
+    use_gh = source in {"auto", "gh"} and bool(shutil.which("gh"))
+    if source == "gh" and not use_gh:
+        return [], [f"Could not scan {repo}: requested 'gh' CLI was not found on PATH."]
 
-    api_status = _gh_api_json_status if use_gh else _http_api_json_status
-    fetch_raw = _gh_fetch_raw if use_gh else _http_fetch_raw
-
-    resolved_branch = branch
-    if not resolved_branch:
+    if not branch:
+        api_status = _gh_api_json_status if use_gh else _http_api_json_status
         meta, status = api_status(f"repos/{repo}", timeout=timeout)
-        if status == 404:
-            if not optional_repo:
-                warnings.append(f"Repository {repo} was not found (HTTP 404).")
-            return [], warnings
-        if isinstance(meta, dict) and isinstance(meta.get("default_branch"), str):
-            resolved_branch = meta["default_branch"]
-        elif source == "auto" and use_gh:
-            # gh may be unauthenticated or offline; try unauthenticated REST API next.
+        if not isinstance(meta, dict) and status != 404 and source == "auto" and use_gh:
+            # An unavailable or unauthenticated gh can be replaced by public HTTPS.
             use_gh = False
-            api_status = _http_api_json_status
-            fetch_raw = _http_fetch_raw
-            meta, status = api_status(f"repos/{repo}", timeout=timeout)
-            if status == 404:
-                if not optional_repo:
-                    warnings.append(f"Repository {repo} was not found (HTTP 404).")
-                return [], warnings
-            if isinstance(meta, dict) and isinstance(meta.get("default_branch"), str):
-                resolved_branch = meta["default_branch"]
+            meta, status = _http_api_json_status(f"repos/{repo}", timeout=timeout)
+        if status == 404:
+            return [], [] if optional_repo else [f"Repository {repo} was not found (HTTP 404)."]
+        if isinstance(meta, dict) and isinstance(meta.get("default_branch"), str) and meta["default_branch"]:
+            branch = meta["default_branch"]
+        else:
+            warnings.append(f"Could not look up the default branch for {repo} ({_fetch_error(status)}).")
 
-    branches_to_try = [resolved_branch] if resolved_branch else ["main", "master"]
+    fetch_raw = _gh_fetch_raw if use_gh else _http_fetch_raw
     docs: List[ScannedFile] = []
-
-    for candidate_branch in branches_to_try:
-        paths = _list_remote_policy_paths(repo, candidate_branch, use_gh=use_gh, timeout=timeout)
+    for candidate_branch in [branch] if branch else ["main", "master"]:
+        paths, listing_warnings = _list_remote_policy_paths(repo, candidate_branch, use_gh, timeout)
+        warnings.extend(listing_warnings)
         if paths is not None:
             if paths:
                 with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
-                    contents = list(
-                        pool.map(
-                            lambda p: fetch_raw(repo, candidate_branch, p, timeout=timeout),
-                            paths,
-                        )
-                    )
-                for path, content in zip(paths, contents):
-                    if content is not None:
-                        docs.append(
-                            ScannedFile(
-                                path=f"{prefix}{path}",
-                                content=content,
-                                source="gh" if use_gh else "raw",
+                    results = pool.map(lambda p: fetch_raw(repo, candidate_branch, p, timeout=timeout), paths)
+                    for path, (content, status) in zip(paths, results):
+                        if content is None:
+                            warnings.append(
+                                f"Could not read policy file {repo}@{candidate_branch}:{path} ({_fetch_error(status)})."
                             )
-                        )
+                        else:
+                            docs.append(ScannedFile(f"{prefix}{path}", content, "gh" if use_gh else "raw"))
             return docs, warnings
 
-        # Directory listing unavailable (e.g., API rate limit): probe raw URLs in parallel.
+        # A failed listing leaves custom filenames undiscovered. Probe known paths for restrictions.
         with ThreadPoolExecutor(max_workers=min(8, len(RAW_FALLBACK_PATHS))) as pool:
-            probed = list(
-                pool.map(
-                    lambda p: _http_fetch_raw(repo, candidate_branch, p, timeout=timeout),
-                    RAW_FALLBACK_PATHS,
-                )
-            )
-        probed_any = False
-        for path, content in zip(RAW_FALLBACK_PATHS, probed):
-            if content is not None:
-                probed_any = True
-                docs.append(ScannedFile(path=f"{prefix}{path}", content=content, source="raw"))
-        if probed_any:
+            results = pool.map(lambda p: _http_fetch_raw(repo, candidate_branch, p, timeout=timeout), RAW_FALLBACK_PATHS)
+            for path, (content, status) in zip(RAW_FALLBACK_PATHS, results):
+                if content is not None:
+                    docs.append(ScannedFile(f"{prefix}{path}", content, "raw"))
+                elif status != 404:
+                    warnings.append(
+                        f"Could not probe policy path {repo}@{candidate_branch}:{path} ({_fetch_error(status)})."
+                    )
+        if docs:
             warnings.append(
-                f"Used direct raw-URL probes for {repo}@{candidate_branch}; custom template filenames may require manual review."
+                f"Used direct raw-URL probes for {repo}@{candidate_branch}; custom policy paths may require manual review."
             )
             return docs, warnings
 
